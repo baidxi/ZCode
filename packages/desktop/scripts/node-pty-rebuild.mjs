@@ -77,8 +77,27 @@ export async function resolveNodePtyRebuildDecision({
 function runElectronRebuild() {
   return new Promise((resolve, reject) => {
     const command = process.platform === "win32" ? "electron-rebuild.cmd" : "electron-rebuild";
-    const child = spawn(command, ["-o", "node-pty"], {
+    const args = ["-o", "node-pty"];
+    // electron-rebuild 默认从 https://www.electronjs.org/headers 下载 Electron 头文件，
+    // 该地址在部分网络环境不可达（ETIMEDOUT）。允许通过 ELECTRON_REBUILD_DIST_URL
+    // 指定镜像（如 https://npmmirror.com/mirrors/electron），与 ELECTRON_MIRROR 生态保持一致。
+    // 注意：镜像站一般只同步 Electron 发行版 SHASUMS，其中没有 headers 条目，
+    // node-gyp 下载后校验会报 "local checksum ... not match remote undefined"。
+    const distUrl = process.env.ELECTRON_REBUILD_DIST_URL;
+    if (distUrl) {
+      args.push("--dist-url", distUrl);
+    }
+    const spawnEnv = { ...process.env };
+    // ELECTRON_REBUILD_HEADERS_TARBALL 指向本地下载好的 node-v<electron>-headers.tar.gz。
+    // node-gyp 会把 npm_config_* 环境变量并入自身选项，指定 tarball 后完全跳过
+    // 远端下载与 SHASUMS 校验。env 只注入本子进程，避免影响其他原生模块构建。
+    const headersTarball = process.env.ELECTRON_REBUILD_HEADERS_TARBALL;
+    if (headersTarball) {
+      spawnEnv.npm_config_tarball = headersTarball;
+    }
+    const child = spawn(command, args, {
       cwd: process.cwd(),
+      env: spawnEnv,
       stdio: "inherit",
     });
 

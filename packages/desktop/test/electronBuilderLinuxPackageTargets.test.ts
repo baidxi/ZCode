@@ -1,5 +1,11 @@
+import { mkdtempSync, rmSync, statSync, writeFileSync, chmodSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import desktopBuilderConfig from "../electron-builder.config.js";
+import desktopBuilderConfig, {
+  applyLinuxSuidSandboxPermissions,
+  resolveLinuxPackageTargets,
+} from "../electron-builder.config.js";
 import { resolveDesktopProductIdentity } from "../scripts/desktop-product-identity.mjs";
 
 // Linux 打包目标契约：rpm 是 deb 之外的安装分发格式，不能改变既有更新链路。
@@ -10,13 +16,55 @@ describe("electron-builder Linux 打包目标", () => {
     expect(desktopBuilderConfig.detectUpdateChannel).toBe(false);
   });
 
-  it("Linux 同时产出 AppImage、deb、rpm 与 pacman 安装包", () => {
-    const targets = desktopBuilderConfig.linux?.target ?? [];
+  it("具备 rpmbuild 的构建机产出完整的 AppImage、deb、rpm 与 pacman 安装包", () => {
+    // 完整分发矩阵是发布契约：AppImage 承担 Linux 自动更新（latest.yml 按 AppImage 解析），
+    // rpm/pacman 分别服务 RHEL 与 Arch 用户。构建机具备 rpmbuild 时四件套必须齐全。
+    const targets = resolveLinuxPackageTargets({
+      hasRpmbuild: () => true,
+      hasBsdtar: () => true,
+    });
 
     expect(targets).toContain("AppImage");
     expect(targets).toContain("deb");
     expect(targets).toContain("rpm");
     expect(targets).toContain("pacman");
+  });
+
+  it("deb 系构建机（无 rpmbuild）自动跳过 rpm 且保留其余目标", () => {
+    // Debian/Ubuntu 构建机默认没有 rpmbuild，rpm 阶段会失败并中断后续目标；
+    // 此时降级为 AppImage + deb + pacman，更新链路（AppImage）不受影响。
+    const targets = resolveLinuxPackageTargets({
+      hasRpmbuild: () => false,
+      hasBsdtar: () => true,
+    });
+
+    expect(targets).not.toContain("rpm");
+    expect(targets).toContain("AppImage");
+    expect(targets).toContain("deb");
+    expect(targets).toContain("pacman");
+  });
+
+  it("无 bsdtar 的构建机自动跳过 pacman", () => {
+    // pacman 目标需要 bsdtar 生成 .MTREE，deb 系构建机默认没有；
+    // 缺工具时跳过 pacman，避免打包链路中断。
+    const targets = resolveLinuxPackageTargets({
+      hasRpmbuild: () => true,
+      hasBsdtar: () => false,
+    });
+
+    expect(targets).not.toContain("pacman");
+    expect(targets).toContain("AppImage");
+    expect(targets).toContain("deb");
+    expect(targets).toContain("rpm");
+  });
+
+  it("rpm 与 pacman 工具都缺失时只保留 AppImage 与 deb", () => {
+    const targets = resolveLinuxPackageTargets({
+      hasRpmbuild: () => false,
+      hasBsdtar: () => false,
+    });
+
+    expect(targets).toEqual(["AppImage", "deb"]);
   });
 
   it("rpm 与 deb 的 packageName 按 flavor 拆分且保持一致", () => {
@@ -63,5 +111,26 @@ describe("electron-builder Linux 打包目标", () => {
     // electron-builder 26.8.1 的 pacman 默认产物就是 zstd；显式填写 zstd 会被其
     // 配置 schema 拒绝，因此只约束扩展名，不在配置中覆盖默认压缩格式。
     expect(desktopBuilderConfig.pacman?.compression).toBeUndefined();
+  });
+
+  it("Linux 打包后为 chrome-sandbox 预置 SUID 沙箱权限", () => {
+    // Ubuntu 23.10+ 通过 AppArmor 收紧 unprivileged userns，Electron 回退到 SUID helper
+    // 沙箱模式；chrome-sandbox 必须是 4755。打包时预置后，deb 由 dpkg 以 root 解包即满足
+    // 要求；非 Linux 平台不改动权限。
+    const appOutDir = mkdtempSync(join(tmpdir(), "zcode-chrome-sandbox-test-"));
+    try {
+      const sandboxPath = join(appOutDir, "chrome-sandbox");
+      writeFileSync(sandboxPath, "");
+      chmodSync(sandboxPath, 0o755);
+
+      applyLinuxSuidSandboxPermissions({ electronPlatformName: "linux", appOutDir });
+      expect(statSync(sandboxPath).mode & 0o7777).toBe(0o4755);
+
+      chmodSync(sandboxPath, 0o755);
+      applyLinuxSuidSandboxPermissions({ electronPlatformName: "darwin", appOutDir });
+      expect(statSync(sandboxPath).mode & 0o7777).toBe(0o755);
+    } finally {
+      rmSync(appOutDir, { recursive: true, force: true });
+    }
   });
 });

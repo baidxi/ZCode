@@ -5,7 +5,25 @@ import { app, BrowserWindow, dialog, ipcMain, Menu } from "electron";
 import type { ISettingService } from "@zcode/services";
 import pkg, { CancellationToken } from "electron-updater";
 import semver from "semver";
-const { autoUpdater } = pkg;
+// electron-updater 的 autoUpdater 导出是惰性 getter：首次访问即构造 AppUpdater，
+// 并在构造函数里校验 app.getVersion() 必须是合法 semver。
+// dev 模式下 Electron 加载 packages/desktop/package.json（该文件无 version 字段，
+// 打包版本由 electron-builder.config.js 注入），app.getVersion() 回退为 "0.0"，
+// 模块加载期解构会直接抛 "App version is not a valid semver version: \"0.0\""，
+// 导致 pnpm dev:desktop 的 main 进程无法启动。
+// 这里改用 Proxy 把实例构造推迟到首次真正访问更新能力时（dev 默认禁用自动更新，
+// 正常开发流程不会触发）；打包产物内 app 版本合法，行为不变。
+const autoUpdater = new Proxy({} as typeof pkg.autoUpdater, {
+  get(_target, property) {
+    const instance = pkg.autoUpdater;
+    const value = Reflect.get(instance, property, instance);
+    return typeof value === "function" ? value.bind(instance) : value;
+  },
+  set(_target, property, value) {
+    Reflect.set(pkg.autoUpdater, property, value, pkg.autoUpdater);
+    return true;
+  },
+});
 const execFileAsync = promisify(execFile);
 const LINUX_SUDO_PROBE_TIMEOUT_MS = 3_000;
 import {

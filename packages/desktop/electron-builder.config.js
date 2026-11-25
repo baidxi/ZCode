@@ -1,5 +1,6 @@
 /* eslint-disable max-lines -- Electron Builder config keeps related packaging hooks together so build order stays explicit. */
-import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -53,6 +54,66 @@ import {
 
 const buildMetadata = getBuildMetadata();
 const targetPlatform = getTargetPlatform();
+
+// Linux 各系统包目标依赖构建机上的对应工具：rpm 由 rpmbuild 实际打包（fpm 只负责
+// 调用与封装），pacman 需要 bsdtar 生成 .MTREE。Debian/Ubuntu 等 deb 系构建机默认
+// 没有 rpmbuild/bsdtar，打包会在对应目标阶段失败并中断整个产物链。
+// 检测不到所需工具时自动跳过对应目标，工具齐全的环境（RHEL/Fedora、Arch、CI 容器）
+// 保持完整分发矩阵。检测函数支持注入以便单测。
+const LINUX_TARGET_TOOL_CHECKS = {
+  rpm: () => hasRpmbuildOnPath(),
+  pacman: () => hasBsdtarOnPath(),
+};
+
+export function resolveLinuxPackageTargets({
+  hasRpmbuild = hasRpmbuildOnPath,
+  hasBsdtar = hasBsdtarOnPath,
+} = {}) {
+  const toolChecks = { rpm: hasRpmbuild, pacman: hasBsdtar };
+  const skippedTargets = [];
+  const targets = ["AppImage", "deb", "rpm", "pacman"].filter((target) => {
+    const checkTool = toolChecks[target];
+    if (checkTool && !checkTool()) {
+      skippedTargets.push(target);
+      return false;
+    }
+    return true;
+  });
+  if (skippedTargets.length > 0) {
+    console.log(
+      `[electron-builder] 构建机缺少 ${skippedTargets
+        .map((target) => (target === "rpm" ? "rpmbuild" : "bsdtar"))
+        .join("、")}，跳过 ${skippedTargets.join("、")} 目标（安装对应工具后恢复完整矩阵）`,
+    );
+  }
+  return targets;
+}
+
+export function hasRpmbuildOnPath() {
+  const result = spawnSync("rpmbuild", ["--version"], { stdio: "ignore" });
+  return !result.error && result.status === 0;
+}
+
+export function hasBsdtarOnPath() {
+  const result = spawnSync("bsdtar", ["--version"], { stdio: "ignore" });
+  return !result.error && result.status === 0;
+}
+
+// Linux 打包后为 chrome-sandbox 预置 SUID 沙箱权限（root:root 4755）。
+// 修复原因：Ubuntu 23.10+ 默认通过 AppArmor 收紧 unprivileged userns
+// （kernel.apparmor_restrict_unprivileged_userns=1），Electron 的 userns 沙箱被拦后
+// 回退到 SUID helper 模式，chrome-sandbox 不满足 root:root 4755 时启动直接 FATAL abort。
+// 打包时预置 SUID 位后，deb 由 dpkg 以 root 解包，安装完即满足要求（与 Chrome 官方 deb
+// 同款做法）；AppImage 因 FUSE nosuid 无法生效，行为与现状一致。
+// 检测通过 context.electronPlatformName 判断，非 Linux 平台不做任何改动。
+export function applyLinuxSuidSandboxPermissions(context) {
+  if (context.electronPlatformName !== "linux") {
+    return;
+  }
+  const chromeSandboxPath = join(context.appOutDir, "chrome-sandbox");
+  chmodSync(chromeSandboxPath, 0o4755);
+  console.log(`[afterPack] set SUID sandbox permissions: ${chromeSandboxPath} (4755)`);
+}
 // 修复原因：Windows Chrome 导入入口已暂时隐藏，默认安装包不应继续携带、签名或校验原生 helper。
 // 代码和完整供应链保留在显式 opt-in 后，便于未来恢复而不影响当前发布流程。
 const shouldPackageWindowsBrowserImportHelper =
@@ -775,6 +836,9 @@ export default {
     runTimedSync("afterPack:assertPackagedMacElectronLocales", () =>
       assertPackagedMacElectronLocales(context),
     );
+    runTimedSync("afterPack:setLinuxSuidSandboxPermissions", () =>
+      applyLinuxSuidSandboxPermissions(context),
+    );
     if (actualWindowsTarget && shouldPackageComputerUseHelper) {
       await runTimedAsync("afterPack:finalizePackagedWindowsCuaHelper", () =>
         finalizePackagedWindowsCuaHelper({
@@ -1032,7 +1096,7 @@ export default {
       : {}),
   },
   linux: {
-    target: ["AppImage", "deb", "rpm", "pacman"],
+    target: resolveLinuxPackageTargets(),
     artifactName: buildDesktopArtifactName("linux"),
     // desktop 包名是 scoped package（@zcode/desktop），electron-builder 默认会把
     // Linux executable/Icon 推成 @zcodedesktop。部分桌面环境无法按这个 icon name 命中
